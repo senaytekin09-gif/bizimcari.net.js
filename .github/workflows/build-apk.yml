@@ -2,7 +2,7 @@ name: APK Derle
 
 on:
   push:
-    branches: [main]
+    branches: [main, asistans-app]
   workflow_dispatch:
 
 permissions:
