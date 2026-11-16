@@ -5,8 +5,16 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.AudioManager
+import android.media.Ringtone
+import android.media.RingtoneManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.provider.Settings
 import android.telecom.Call
 import android.telecom.CallAudioState
 import android.telecom.VideoProfile
@@ -35,13 +43,62 @@ object CallManager {
     var lastStatus: String = ""
         private set
 
+    /** Görüşme boyunca ekranda kalan uyarı (ör. mikrofon/TTS sorunu) */
+    var warning: String = ""
+        private set
+
     fun status(s: String) {
         lastStatus = s
         main.post { onStatus?.invoke(s) }
     }
 
+    fun warn(s: String) {
+        warning = s
+        main.post { onStatus?.invoke(lastStatus) }
+    }
+
+    // --- Zil sesi: varsayılan telefon uygulaması zili kendisi çalmak zorunda ---
+    private var ringtone: Ringtone? = null
+    private var vibrator: Vibrator? = null
+
+    private fun startRinging(ctx: Context) {
+        stopRinging()
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val mode = am.ringerMode
+        if (mode == AudioManager.RINGER_MODE_NORMAL) {
+            try {
+                val uri = RingtoneManager.getActualDefaultRingtoneUri(ctx, RingtoneManager.TYPE_RINGTONE)
+                    ?: Settings.System.DEFAULT_RINGTONE_URI
+                ringtone = RingtoneManager.getRingtone(ctx, uri)?.apply {
+                    audioAttributes = AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                    if (Build.VERSION.SDK_INT >= 28) isLooping = true
+                    play()
+                }
+            } catch (_: Exception) {}
+        }
+        if (mode != AudioManager.RINGER_MODE_SILENT) {
+            try {
+                @Suppress("DEPRECATION")
+                vibrator = (ctx.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator)?.apply {
+                    vibrate(VibrationEffect.createWaveform(longArrayOf(0, 800, 800), 0))
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun stopRinging() {
+        try { ringtone?.stop() } catch (_: Exception) {}
+        ringtone = null
+        try { vibrator?.cancel() } catch (_: Exception) {}
+        vibrator = null
+    }
+
     private val callback = object : Call.Callback() {
         override fun onStateChanged(c: Call, state: Int) {
+            if (state != Call.STATE_RINGING) stopRinging()
             when (state) {
                 Call.STATE_ACTIVE -> {
                     if (aiPending) {
@@ -59,8 +116,10 @@ object CallManager {
         number = c.details.handle?.schemeSpecificPart.orEmpty()
         contactName = ContactsHelper.nameFor(ctx, number)
         c.registerCallback(callback)
+        warning = ""
 
         val incoming = c.state == Call.STATE_RINGING
+        if (incoming) startRinging(ctx)
         status(if (incoming) "Gelen arama: ${contactName ?: number}" else "Aranıyor: ${contactName ?: number}")
         showCallUi(ctx, incoming)
 
@@ -78,6 +137,7 @@ object CallManager {
     fun onCallRemoved(ctx: Context, c: Call) {
         c.unregisterCallback(callback)
         if (call === c) {
+            stopRinging()
             autoAnswerTask?.let { main.removeCallbacks(it) }
             autoAnswerTask = null
             ai?.finish(hangup = false)
@@ -121,6 +181,7 @@ object CallManager {
     }
 
     private fun cancelAuto() {
+        stopRinging()
         autoAnswerTask?.let { main.removeCallbacks(it) }
         autoAnswerTask = null
     }

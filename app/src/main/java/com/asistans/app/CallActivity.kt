@@ -10,14 +10,16 @@ import androidx.appcompat.app.AppCompatActivity
 class CallActivity : AppCompatActivity() {
     private lateinit var who: TextView
     private lateinit var status: TextView
+    private lateinit var warning: TextView
     private lateinit var buttons: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         who = label("", 26f, true)
         status = label("", 16f)
+        warning = label("", 14f).apply { setTextColor(0xFFB3261E.toInt()) }
         buttons = column().apply { setPadding(0, dp(24), 0, 0) }
-        setContentView(column().add(who, status, buttons))
+        setContentView(column().add(who, status, warning, buttons))
     }
 
     override fun onResume() {
@@ -40,6 +42,7 @@ class CallActivity : AppCompatActivity() {
         }
         who.text = CallManager.contactName ?: CallManager.number
         status.text = CallManager.lastStatus
+        warning.text = CallManager.warning.let { if (it.isBlank()) "" else "⚠️ $it" }
         buttons.removeAllViews()
         if (call.state == Call.STATE_RINGING) {
             buttons.add(

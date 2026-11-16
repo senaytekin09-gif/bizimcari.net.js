@@ -3,7 +3,9 @@ package com.asistans.app
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -36,6 +38,9 @@ class AiConversation(
 
     private var tts: TextToSpeech? = null
     private var stt: SpeechRecognizer? = null
+    private var mic: MicStream? = null
+    private var micFailed = false
+    private var errorStreak = 0
     private var finished = false
     private var hangupAfterSpeech = false
     private var silentTurns = 0
@@ -69,33 +74,46 @@ class AiConversation(
 
     fun start() {
         boostVolume()
-        tts = TextToSpeech(ctx) { status ->
-            if (status != TextToSpeech.SUCCESS) { finish(hangup = false); return@TextToSpeech }
-            tts?.language = Locale("tr", "TR")
-            tts?.setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(id: String?) {}
-                override fun onDone(id: String?) {
-                    main.post {
-                        if (finished) return@post
-                        if (hangupAfterSpeech) finish(hangup = true) else listen()
-                    }
-                }
-                @Deprecated("eski API")
-                override fun onError(id: String?) { main.post { if (!finished) listen() } }
-            })
-            val greet = prefs.greeting.ifBlank {
-                "Merhaba, ben $ownerName'in yapay zekâ asistanıyım. Kendisi şu an telefona çıkamıyor. Kiminle görüşüyorum ve nasıl yardımcı olabilirim?"
-            }
-            history.add(Msg("user", "(Arama başladı. Arayanı karşıla.)"))
-            history.add(Msg("assistant", greet))
-            say(greet)
+        lateinit var engine: TextToSpeech
+        engine = TextToSpeech(ctx) { status ->
+            main.post { onTtsReady(engine, status) }
         }
+        tts = engine
+    }
+
+    private fun onTtsReady(engine: TextToSpeech, status: Int) {
+        if (finished) return
+        if (status != TextToSpeech.SUCCESS) {
+            CallManager.status("Metin okuma (TTS) başlatılamadı")
+            finish(hangup = false); return
+        }
+        val lang = engine.setLanguage(Locale("tr", "TR"))
+        if (lang == TextToSpeech.LANG_MISSING_DATA || lang == TextToSpeech.LANG_NOT_SUPPORTED) {
+            CallManager.warn("Türkçe ses paketi yüklü değil (Ayarlar → Metin okuma)")
+        }
+        engine.setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+        )
+        engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(id: String?) {}
+            override fun onDone(id: String?) {
+                main.post {
+                    if (finished) return@post
+                    if (hangupAfterSpeech) finish(hangup = true) else listen()
+                }
+            }
+            @Deprecated("eski API")
+            override fun onError(id: String?) { main.post { if (!finished) listen() } }
+        })
+        val greet = prefs.greeting.ifBlank {
+            "Merhaba, ben $ownerName'in yapay zekâ asistanıyım. Kendisi şu an telefona çıkamıyor. Kiminle görüşüyorum ve nasıl yardımcı olabilirim?"
+        }
+        history.add(Msg("user", "(Arama başladı. Arayanı karşıla.)"))
+        history.add(Msg("assistant", greet))
+        say(greet)
     }
 
     private fun say(text: String) {
@@ -106,26 +124,53 @@ class AiConversation(
         tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "u${System.nanoTime()}")
     }
 
+    private fun closeMic() { mic?.close(); mic = null }
+
     private fun listen() {
         if (finished) return
         if (!SpeechRecognizer.isRecognitionAvailable(ctx)) {
-            CallManager.status("Bu cihazda konuşma tanıma yok")
+            CallManager.status("Bu cihazda konuşma tanıma yok (Google uygulaması gerekli)")
             finish(hangup = false); return
         }
         stt?.destroy()
+        closeMic()
+        // Görüşme sırasında mikrofonu biz okuyup konuşma tanımaya veriyoruz (Android 13+ ve erişilebilirlik hizmeti açıkken)
+        val m = if (Build.VERSION.SDK_INT >= 33 && !micFailed && CallAudioAccessibilityService.isEnabled(ctx))
+            MicStream.open(ctx) else null
+        mic = m
         stt = SpeechRecognizer.createSpeechRecognizer(ctx).apply {
             setRecognitionListener(object : RecognitionListener {
                 override fun onResults(results: Bundle?) {
+                    errorStreak = 0
+                    closeMic()
                     val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                    if (text.isNullOrBlank()) onSilence() else onHeard(text)
+                    if (text.isNullOrBlank()) onSilence(m) else onHeard(text)
                 }
                 override fun onError(error: Int) {
+                    closeMic()
+                    if (finished) return
                     when (error) {
-                        SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> onSilence()
-                        else -> main.postDelayed({ listen() }, 500)
+                        SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                            errorStreak = 0
+                            onSilence(m)
+                        }
+                        else -> {
+                            errorStreak++
+                            if (m != null && errorStreak >= 2) {
+                                // Konuşma tanıma uygulaması dışarıdan ses akışını kabul etmiyor: standart yönteme dön
+                                micFailed = true
+                                CallManager.warn("Konuşma tanıma uygulaması dışarıdan ses akışını kabul etmedi (hata $error), standart yönteme geçildi")
+                            } else {
+                                CallManager.status("Konuşma tanıma hatası ($error), tekrar deneniyor…")
+                            }
+                            if (errorStreak >= 6) finish(hangup = false)
+                            else main.postDelayed({ listen() }, 500)
+                        }
                     }
                 }
-                override fun onReadyForSpeech(p: Bundle?) { CallManager.status("Dinliyor…") }
+                override fun onReadyForSpeech(p: Bundle?) {
+                    CallManager.status(if (m != null) "Dinliyor… (görüşme mikrofonu)" else "Dinliyor…")
+                }
                 override fun onBeginningOfSpeech() {}
                 override fun onRmsChanged(v: Float) {}
                 override fun onBufferReceived(b: ByteArray?) {}
@@ -138,13 +183,25 @@ class AiConversation(
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, "tr-TR")
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+                if (m != null && Build.VERSION.SDK_INT >= 33) {
+                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, m.fd)
+                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+                    putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, MicStream.SAMPLE_RATE)
+                }
             })
         }
     }
 
-    private fun onSilence() {
+    private fun onSilence(m: MicStream?) {
         if (finished) return
         silentTurns++
+        when {
+            m != null && m.peak == 0 -> CallManager.warn("Mikrofondan hiç ses gelmiyor: bu telefon görüşme sırasında mikrofonu vermiyor olabilir")
+            m == null && Build.VERSION.SDK_INT < 33 -> CallManager.warn("Android 13 altı: görüşme sırasında arayanın sesi alınamayabilir")
+            m == null && !CallAudioAccessibilityService.isEnabled(ctx) ->
+                CallManager.warn("Arayanı duyamıyorum: 'Asistans arama sesi' erişilebilirlik hizmetini açın")
+        }
         when {
             silentTurns >= 3 -> { hangupAfterSpeech = true; say("Sesinizi alamıyorum. Mesajınızı daha sonra iletebilirsiniz, iyi günler.") }
             silentTurns == 2 -> say("Beni duyuyor musunuz?")
@@ -168,7 +225,7 @@ class AiConversation(
             val reply = try {
                 ClaudeClient.send(prefs.apiKey, prefs.model, systemPrompt(), history)
             } catch (e: Exception) {
-                CallManager.status("Hata: ${e.message}")
+                CallManager.warn("Claude API hatası: ${e.message?.take(200)}")
                 "Kusura bakmayın, bir sorun oluştu. Mesajınızı $ownerName'e ileteceğim. [KAPAT]"
             }
             if (finished) return@launch
@@ -190,6 +247,7 @@ class AiConversation(
         finished = true
         main.post {
             stt?.destroy(); stt = null
+            closeMic()
             tts?.stop(); tts?.shutdown(); tts = null
         }
         onFinished(hangup)

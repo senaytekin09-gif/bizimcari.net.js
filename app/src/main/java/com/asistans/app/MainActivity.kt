@@ -5,6 +5,8 @@ import android.app.role.RoleManager
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
+import android.speech.tts.TextToSpeech
 import android.text.InputType
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -14,6 +16,11 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -21,7 +28,11 @@ import java.util.Locale
 class MainActivity : AppCompatActivity() {
     private lateinit var prefs: Prefs
     private lateinit var roleStatus: TextView
+    private lateinit var a11yStatus: TextView
+    private lateinit var crashBox: LinearLayout
     private lateinit var logList: LinearLayout
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var testTts: TextToSpeech? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -39,13 +50,23 @@ class MainActivity : AppCompatActivity() {
         val share = switch("Arayanın rehberdeki adını yapay zekâya gönder", prefs.shareContactName)
 
         roleStatus = label("", 14f)
+        a11yStatus = label("", 14f)
+        crashBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         logList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         val root = column().add(
             label("Asistans", 26f, true),
+            crashBox,
             roleStatus,
             button("1) Varsayılan telefon uygulaması yap") { requestDialerRole() },
             button("2) İzinleri ver") { requestPerms() },
+            a11yStatus,
+            button("3) Arama sesi erişimini aç (Erişilebilirlik)") { openA11y() },
+            label(
+                "Android, görüşme sırasında mikrofonu yalnızca erişilebilirlik hizmetlerine verir. " +
+                    "Ayarlar'da 'Asistans arama sesi'ni açın. Seçenek gri ise: Ayarlar → Uygulamalar → Asistans → sağ üst ⋮ → " +
+                    "'Kısıtlanmış ayarlara izin ver', sonra tekrar deneyin.", 13f
+            ),
             label("Ayarlar", 18f, true),
             apiKey, model, owner, delay, greeting, extra, auto, onlyUnknown, share,
             button("💾 Kaydet") {
@@ -60,6 +81,10 @@ class MainActivity : AppCompatActivity() {
                 prefs.shareContactName = share.isChecked
                 Toast.makeText(this, "Kaydedildi", Toast.LENGTH_SHORT).show()
             },
+            button("🔑 API anahtarını test et") {
+                testApi(apiKey.text.toString().trim(), model.text.toString().trim().ifBlank { "claude-haiku-5-5" })
+            },
+            button("🔊 Türkçe sesi test et") { testVoice(owner.text.toString()) },
             button("📞 Tuş takımı") { startActivity(Intent(this, DialerActivity::class.java)) },
             label("Asistanın görüşmeleri", 18f, true),
             button("Kayıtları temizle") { CallLogStore.clear(this); renderLog() },
@@ -74,7 +99,78 @@ class MainActivity : AppCompatActivity() {
         val rm = getSystemService(RoleManager::class.java)
         roleStatus.text = if (rm.isRoleHeld(RoleManager.ROLE_DIALER))
             "✅ Varsayılan telefon uygulaması" else "⚠️ Henüz varsayılan telefon uygulaması değil — asistan aramaları açamaz"
+        a11yStatus.text = when {
+            Build.VERSION.SDK_INT < 33 -> "⚠️ Android 13 altı: görüşme sırasında arayanın sesi alınamayabilir"
+            CallAudioAccessibilityService.isEnabled(this) -> "✅ Arama sesi erişimi açık"
+            else -> "⚠️ Arama sesi erişimi kapalı — asistan arayanı duyamaz"
+        }
+        renderCrash()
         renderLog()
+    }
+
+    override fun onDestroy() {
+        testTts?.shutdown(); testTts = null
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    private fun openA11y() {
+        try { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+        catch (_: Exception) { Toast.makeText(this, "Erişilebilirlik ayarları açılamadı", Toast.LENGTH_LONG).show() }
+    }
+
+    private fun renderCrash() {
+        crashBox.removeAllViews()
+        val crash = App.lastCrash(this) ?: return
+        val t = label("❗ Uygulama son çalışmada çöktü. Ayrıntı için dokunun.", 14f).apply {
+            setTextColor(0xFFB3261E.toInt())
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity).setTitle("Hata kaydı").setMessage(crash)
+                    .setPositiveButton("Kopyala") { _, _ ->
+                        val cm = getSystemService(android.content.ClipboardManager::class.java)
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("Asistans hata", crash))
+                        Toast.makeText(this@MainActivity, "Kopyalandı", Toast.LENGTH_SHORT).show()
+                    }
+                    .setNegativeButton("Sil") { _, _ -> App.crashFile(this@MainActivity).delete(); renderCrash() }
+                    .show()
+            }
+        }
+        crashBox.addView(t)
+    }
+
+    private fun testApi(key: String, model: String) {
+        if (key.isBlank()) { Toast.makeText(this, "Önce API anahtarını girin", Toast.LENGTH_SHORT).show(); return }
+        Toast.makeText(this, "Deneniyor…", Toast.LENGTH_SHORT).show()
+        scope.launch {
+            val msg = try {
+                val r = ClaudeClient.send(key, model, "Kısa cevap ver.", listOf(Msg("user", "Sadece 'Tamam' yaz.")), maxTokens = 10)
+                "✅ Çalışıyor ($model): $r"
+            } catch (e: Exception) {
+                "❌ ${e.message?.take(400)}"
+            }
+            AlertDialog.Builder(this@MainActivity).setTitle("API testi").setMessage(msg).setPositiveButton("Tamam", null).show()
+        }
+    }
+
+    private fun testVoice(name: String) {
+        testTts?.shutdown()
+        lateinit var engine: TextToSpeech
+        engine = TextToSpeech(this) { status ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                if (status != TextToSpeech.SUCCESS) {
+                    Toast.makeText(this, "Metin okuma motoru başlatılamadı", Toast.LENGTH_LONG).show(); return@post
+                }
+                val r = engine.setLanguage(Locale("tr", "TR"))
+                if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    Toast.makeText(this, "Türkçe ses yüklü değil: Ayarlar → Metin okuma → Türkçe ses verisini indirin", Toast.LENGTH_LONG).show()
+                    try { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) } catch (_: Exception) {}
+                    return@post
+                }
+                val who = name.ifBlank { "telefon sahibi" }
+                engine.speak("Merhaba, ben $who'in yapay zekâ asistanıyım.", TextToSpeech.QUEUE_FLUSH, null, "test")
+            }
+        }
+        testTts = engine
     }
 
     private fun renderLog() {

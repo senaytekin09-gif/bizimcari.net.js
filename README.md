@@ -11,8 +11,12 @@ Görüşme bitince Claude kısa bir özet çıkarır, özet uygulamada listeleni
 5. Uygulamada sırasıyla:
    - **Varsayılan telefon uygulaması yap**. Bu zorunlu: Android, aramayı açma ve ses yönlendirme yetkisini yalnızca varsayılan telefon uygulamasına verir.
    - **İzinleri ver**.
+   - **Arama sesi erişimini aç**: Ayarlar → Erişilebilirlik → *Asistans arama sesi* → Aç. Android, görüşme sırasında mikrofonu yalnızca erişilebilirlik hizmetlerine verir; bu açık olmazsa asistan arayanı duyamaz (Android 13 ve üstü). Seçenek gri görünüyorsa: Ayarlar → Uygulamalar → Asistans → sağ üst ⋮ → *Kısıtlanmış ayarlara izin ver*.
    - Claude API anahtarını gir (console.anthropic.com → API Keys), adını yaz, **Kaydet**.
    - "Gelen aramaları asistan otomatik açsın" seçeneğini aç.
+   - **API anahtarını test et** ve **Türkçe sesi test et** düğmeleriyle ayarları kontrol et.
+
+> GitHub'dan indirilen APK'lar her derlemede farklı bir anahtarla imzalanır. Yeni sürümü kurmadan önce eskisini kaldırın, yoksa "Uygulama yüklenmedi" hatası alırsınız.
 
 ## Nasıl çalışır
 Gelen arama → X saniye sonra açılır → hoparlöre alınır → TTS ile karşılama yapılır → arayanın sesi Google konuşma tanıma ile yazıya çevrilir → Claude'a gönderilir → cevap TTS ile okunur → bu döngü devam eder.

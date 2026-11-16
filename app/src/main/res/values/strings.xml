@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">Asistans</string>
+    <string name="a11y_label">Asistans arama sesi</string>
+    <string name="a11y_desc">Asistanın telefon görüşmesi sırasında arayanın sesini duyabilmesi için gereklidir. Ekran içeriği okunmaz, hiçbir veri toplanmaz.</string>
 </resources>
